@@ -1,0 +1,268 @@
+# =============================================================================
+# Failover Pilot Light: AWS caído → desplegar todo en Azure
+# =============================================================================
+# Despliega la infraestructura simétrica de Azure (bastión + VM privada +
+# Azure DB en subred delegada), restaura el último backup desde S3 y
+# arranca la aplicación.
+#
+# Flujo del workflow:
+#   1. terraform apply → bastión + VM Docker + Azure DB + red completa
+#   2. Configurar Nginx en el bastión apuntando a la IP privada de la VM
+#   3. Esperar a que la VM tenga Docker instalado
+#   4. Descargar el dump desde S3 (donde lo dejó el backup-rds.yml del repo AWS)
+#   5. Copiar el dump al bastión y de ahí a la VM
+#   6. Restaurar el dump en Azure DB desde la VM (única que ve Azure DB)
+#   7. Construir y arrancar el contenedor Docker con la app PHP
+#   8. Verificar el health check
+#
+# Secretos necesarios:
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN (para S3)
+#   AZURE_CREDENTIALS, AZURE_STORAGE_KEY
+#   DB_PASSWORD, VM_ADMIN_PASSWORD
+#   TFSTATE_BUCKET
+# =============================================================================
+
+name: Failover Pilot Light
+
+on:
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TF_DIR: terraform/azure-pilot
+  S3_BUCKET: tfg-gym-backups
+
+jobs:
+  failover:
+    name: Desplegar pilot light en Azure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS (backend S3 y descarga de dump)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      # =================================================================
+      # FASE 1: Desplegar infraestructura Azure
+      # =================================================================
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET }}"
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform apply -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="vm_admin_password=${{ secrets.VM_ADMIN_PASSWORD }}"
+
+      - name: Leer outputs de Terraform
+        id: outputs
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          echo "bastion_ip=$(terraform output -raw bastion_public_ip)" >> "$GITHUB_OUTPUT"
+          echo "app_private_ip=$(terraform output -raw app_private_ip)" >> "$GITHUB_OUTPUT"
+          echo "mysql_fqdn=$(terraform output -raw mysql_fqdn)" >> "$GITHUB_OUTPUT"
+
+      - name: Instalar sshpass
+        run: sudo apt-get install -y -qq sshpass
+
+      # =================================================================
+      # FASE 2: Esperar a que las VMs estén listas
+      # =================================================================
+
+      - name: Esperar a que el bastión esté listo
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          echo "Esperando a que el bastión termine cloud-init..."
+          for i in $(seq 1 30); do
+            if sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              azureuser@${BASTION_IP} "test -f /tmp/bastion-ready" 2>/dev/null; then
+              echo "Bastión listo"
+              break
+            fi
+            echo "  Intento ${i}/30..."
+            sleep 15
+          done
+
+      - name: Esperar a que la VM Docker esté lista
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          APP_IP="${{ steps.outputs.outputs.app_private_ip }}"
+          echo "Esperando a que la VM Docker termine cloud-init..."
+          for i in $(seq 1 30); do
+            if sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+              ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              azureuser@${BASTION_IP} \
+              "sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' ssh -o StrictHostKeyChecking=no azureuser@${APP_IP} 'test -f /tmp/app-ready'" 2>/dev/null; then
+              echo "VM Docker lista"
+              break
+            fi
+            echo "  Intento ${i}/30..."
+            sleep 15
+          done
+
+      # =================================================================
+      # FASE 3: Configurar Nginx en el bastión
+      # =================================================================
+
+      - name: Configurar Nginx reverse proxy en bastión
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          APP_IP="${{ steps.outputs.outputs.app_private_ip }}"
+
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no azureuser@${BASTION_IP} "
+            echo '${{ secrets.VM_ADMIN_PASSWORD }}' | sudo -S sed -i \
+              's/PLACEHOLDER_APP_IP/${APP_IP}/g' /etc/nginx/sites-available/default
+            echo '${{ secrets.VM_ADMIN_PASSWORD }}' | sudo -S nginx -t
+            echo '${{ secrets.VM_ADMIN_PASSWORD }}' | sudo -S systemctl restart nginx
+            echo 'Nginx configurado → ${APP_IP}:80'
+          "
+
+      # =================================================================
+      # FASE 4: Descargar dump desde S3 y restaurar en Azure DB
+      # =================================================================
+
+      - name: Descargar último dump desde S3
+        run: |
+          echo "Descargando dump desde s3://${{ env.S3_BUCKET }}/dumps/latest.sql"
+          aws s3 cp s3://${{ env.S3_BUCKET }}/dumps/latest.sql /tmp/latest.sql
+          ls -lh /tmp/latest.sql
+
+      - name: Copiar dump al bastión y de ahí a la VM
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          APP_IP="${{ steps.outputs.outputs.app_private_ip }}"
+
+          # Runner → Bastión
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            scp -o StrictHostKeyChecking=no \
+            /tmp/latest.sql azureuser@${BASTION_IP}:/tmp/latest.sql
+
+          # Bastión → VM Docker
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no azureuser@${BASTION_IP} "
+            sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' scp -o StrictHostKeyChecking=no \
+              /tmp/latest.sql azureuser@${APP_IP}:/tmp/latest.sql
+            rm -f /tmp/latest.sql
+            echo 'Dump transferido a la VM Docker'
+          "
+
+      - name: Restaurar dump en Azure DB desde la VM
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          APP_IP="${{ steps.outputs.outputs.app_private_ip }}"
+          MYSQL_HOST="${{ steps.outputs.outputs.mysql_fqdn }}"
+
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no azureuser@${BASTION_IP} "
+            sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' ssh -o StrictHostKeyChecking=no azureuser@${APP_IP} '
+              echo \"Esperando a que Azure DB sea accesible...\"
+              for i in \$(seq 1 20); do
+                if mysql -h ${MYSQL_HOST} -u admin_tfg -p\"${{ secrets.DB_PASSWORD }}\" -e \"SELECT 1;\" 2>/dev/null; then
+                  echo \"Azure DB accesible\"
+                  break
+                fi
+                echo \"  Intento \$i/20...\"
+                sleep 15
+              done
+              mysql -h ${MYSQL_HOST} -u admin_tfg -p\"${{ secrets.DB_PASSWORD }}\" gym < /tmp/latest.sql
+              echo \"=== Tablas restauradas ===\"
+              mysql -h ${MYSQL_HOST} -u admin_tfg -p\"${{ secrets.DB_PASSWORD }}\" -e \"USE gym; SHOW TABLES;\"
+              rm -f /tmp/latest.sql
+            '
+          "
+
+      # =================================================================
+      # FASE 5: Construir y arrancar el contenedor Docker
+      # =================================================================
+
+      - name: Copiar app a la VM y construir Docker
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          APP_IP="${{ steps.outputs.outputs.app_private_ip }}"
+          MYSQL_HOST="${{ steps.outputs.outputs.mysql_fqdn }}"
+
+          # Runner → Bastión
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            scp -o StrictHostKeyChecking=no -r \
+            app/web-form azureuser@${BASTION_IP}:/home/azureuser/
+
+          # Bastión → VM Docker, construir imagen y arrancar contenedor
+          sshpass -p "${{ secrets.VM_ADMIN_PASSWORD }}" \
+            ssh -o StrictHostKeyChecking=no azureuser@${BASTION_IP} "
+            sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' scp -o StrictHostKeyChecking=no -r \
+              /home/azureuser/web-form azureuser@${APP_IP}:/home/azureuser/
+            rm -rf /home/azureuser/web-form
+
+            sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' ssh -o StrictHostKeyChecking=no azureuser@${APP_IP} '
+              cd /home/azureuser/web-form
+              echo \"${{ secrets.VM_ADMIN_PASSWORD }}\" | sudo -S docker build -t tfg-gym-app .
+              echo \"${{ secrets.VM_ADMIN_PASSWORD }}\" | sudo -S docker rm -f gym-app 2>/dev/null || true
+              echo \"${{ secrets.VM_ADMIN_PASSWORD }}\" | sudo -S docker run -d \
+                --name gym-app \
+                --restart unless-stopped \
+                -p 80:80 \
+                -e DB_HOST=\"${MYSQL_HOST}\" \
+                -e DB_USER=\"admin_tfg\" \
+                -e DB_PASSWORD=\"${{ secrets.DB_PASSWORD }}\" \
+                -e DB_NAME=\"gym\" \
+                -e DB_PORT=\"3306\" \
+                tfg-gym-app
+              echo \"=== Contenedor corriendo ===\"
+              echo \"${{ secrets.VM_ADMIN_PASSWORD }}\" | sudo -S docker ps
+            '
+          "
+
+      # =================================================================
+      # FASE 6: Verificación
+      # =================================================================
+
+      - name: Health check de la aplicación
+        run: |
+          BASTION_IP="${{ steps.outputs.outputs.bastion_ip }}"
+          echo "Esperando 30s para que el contenedor arranque..."
+          sleep 30
+
+          HEALTH=$(curl -sk https://${BASTION_IP}/health.php 2>/dev/null || echo '{"status":"error"}')
+          echo "Respuesta: $HEALTH"
+
+          if echo "$HEALTH" | grep -q '"status"'; then
+            echo ""
+            echo "============================================"
+            echo "FAILOVER COMPLETADO CON ÉXITO"
+            echo "============================================"
+            echo "URL:      https://${BASTION_IP}"
+            echo "Health:   https://${BASTION_IP}/health.php"
+            echo "Azure DB: ${{ steps.outputs.outputs.mysql_fqdn }}"
+            echo ""
+            echo "Para volver a AWS (failback) ejecutar:"
+            echo "  Workflow 'Destroy Pilot Light'"
+            echo "============================================"
+          else
+            echo "ERROR: el health check falló"
+            exit 1
+          fi

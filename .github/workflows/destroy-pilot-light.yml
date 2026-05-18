@@ -1,0 +1,79 @@
+# =============================================================================
+# Destroy Pilot Light - destruye la infraestructura Azure (failback)
+# =============================================================================
+# IMPORTANTE: requiere confirmación explícita escribiendo "destroy" en el
+# input para evitar destrucciones accidentales.
+#
+# El Blob Storage NO se toca: está en otro resource group y debe persistir
+# entre failovers para conservar el histórico de backups.
+# =============================================================================
+
+name: Destroy Pilot Light
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Escribe "destroy" para confirmar'
+        required: true
+        default: ''
+
+env:
+  AWS_REGION: us-east-1
+  TF_DIR: terraform/azure-pilot
+
+jobs:
+  destroy:
+    name: terraform destroy (Azure pilot)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Validar confirmación
+        if: inputs.confirm != 'destroy'
+        run: |
+          echo "ERROR: Debes escribir 'destroy' en el input para confirmar"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS (para backend S3 del state)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.5.7"
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TFSTATE_BUCKET }}"
+
+      - name: Terraform Destroy
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform destroy -auto-approve \
+            -var="db_password=${{ secrets.DB_PASSWORD }}" \
+            -var="vm_admin_password=${{ secrets.VM_ADMIN_PASSWORD }}"
+
+      - name: Resumen
+        run: |
+          echo "============================================"
+          echo "PILOT LIGHT DESTRUIDO"
+          echo ""
+          echo "El Blob Storage de backups NO se ha tocado."
+          echo "El bucket S3 de backups en AWS tampoco."
+          echo "============================================"
