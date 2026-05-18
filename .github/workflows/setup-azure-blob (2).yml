@@ -1,0 +1,104 @@
+# =============================================================================
+# Setup Azure Blob Storage - crea el resource group, storage account y
+# contenedor para guardar los backups de la BD
+# =============================================================================
+# Recurso PERMANENTE. No se destruye cuando se hace failback. Es el único
+# recurso de Azure que existe en operación normal.
+# =============================================================================
+
+name: Setup Azure Blob Storage
+
+on:
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP:  tfg-final-spain-rg
+  LOCATION:        spaincentral
+  STORAGE_ACCOUNT: stgalvarospain2026
+  CONTAINER:       db-backups
+
+jobs:
+  setup:
+    name: Crear Blob Storage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Crear resource group (si no existe)
+        run: |
+          if az group show --name "${RESOURCE_GROUP}" >/dev/null 2>&1; then
+            echo "Resource group ya existe"
+          else
+            az group create \
+              --name "${RESOURCE_GROUP}" \
+              --location "${LOCATION}"
+            echo "Resource group creado"
+          fi
+
+      - name: Crear storage account (si no existe)
+        run: |
+          if az storage account show \
+            --name "${STORAGE_ACCOUNT}" \
+            --resource-group "${RESOURCE_GROUP}" >/dev/null 2>&1; then
+            echo "Storage account ya existe"
+          else
+            az storage account create \
+              --name "${STORAGE_ACCOUNT}" \
+              --resource-group "${RESOURCE_GROUP}" \
+              --location "${LOCATION}" \
+              --sku Standard_LRS \
+              --kind StorageV2 \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false
+            echo "Storage account creada"
+          fi
+
+      - name: Obtener storage key
+        id: key
+        run: |
+          KEY=$(az storage account keys list \
+            --account-name "${STORAGE_ACCOUNT}" \
+            --resource-group "${RESOURCE_GROUP}" \
+            --query '[0].value' -o tsv)
+
+          # Enmascarar en logs
+          echo "::add-mask::${KEY}"
+          echo "key=${KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Crear contenedor (si no existe)
+        run: |
+          az storage container create \
+            --name "${CONTAINER}" \
+            --account-name "${STORAGE_ACCOUNT}" \
+            --account-key "${{ steps.key.outputs.key }}" \
+            --public-access off
+
+      - name: Guardar storage key como artifact
+        run: |
+          # Escribimos la key a un fichero que descargas manualmente.
+          # GitHub la cifra al storage del artifact.
+          mkdir -p /tmp/secrets
+          echo "${{ steps.key.outputs.key }}" > /tmp/secrets/AZURE_STORAGE_KEY.txt
+          echo ""
+          echo "============================================"
+          echo "STORAGE ACCOUNT LISTA"
+          echo ""
+          echo "Resource Group: ${RESOURCE_GROUP}"
+          echo "Storage:        ${STORAGE_ACCOUNT}"
+          echo "Container:      ${CONTAINER}"
+          echo ""
+          echo ">>> Descarga el artifact 'azure-storage-key' de este run"
+          echo ">>> Abre el fichero AZURE_STORAGE_KEY.txt"
+          echo ">>> Pega el contenido en el secreto AZURE_STORAGE_KEY de GitHub"
+          echo "============================================"
+
+      - name: Subir key como artifact (descargable manualmente)
+        uses: actions/upload-artifact@v4
+        with:
+          name: azure-storage-key
+          path: /tmp/secrets/AZURE_STORAGE_KEY.txt
+          retention-days: 1
