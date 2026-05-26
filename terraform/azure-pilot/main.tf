@@ -233,7 +233,7 @@ resource "azurerm_linux_virtual_machine" "app" {
   # Standard_B1ms: 1 vCPU, 2 GB RAM (~$0.02/h)
   # Cuota verificada: 4 vCPUs en BS Family, Sweden Central
   # SKU disponible sin restricciones (az vm list-skus: None)
-  size = "Standard_B1ms"
+  size = "Standard_B2s_v2"
 
   admin_username                  = "azureuser"
   admin_password                  = var.vm_admin_password
