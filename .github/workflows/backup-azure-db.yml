@@ -204,15 +204,13 @@ jobs:
       - name: "Fase 5.1 — Verificar dump en Azure Blob Storage"
         run: |
           echo " Verificando dump en Azure Blob Storage..."
-          az storage blob show \
+          az storage blob list \
             --account-name ${{ env.STORAGE_ACCOUNT }} \
             --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
             --container-name ${{ env.BLOB_CONTAINER }} \
-            --name "latest.sql" \
-            --prefix "latest.sql"
+            --prefix "latest.sql" \
             --output table \
             --only-show-errors
-
           echo " Verificación Azure Blob OK"
 
       - name: "Fase 5.2 — Verificar dump en S3"
