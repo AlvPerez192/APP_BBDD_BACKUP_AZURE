@@ -73,7 +73,7 @@ jobs:
           sed -i 's/^ *//' ~/.ssh/tfg-gym-key
           chmod 600 ~/.ssh/tfg-gym-key
           ssh-keyscan -H ${{ env.BASTION_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
-          echo "✅ Clave SSH configurada"
+          echo " Clave SSH configurada"
 
       # === FASE 2: DESCARGAR DUMP DE S3 ===
 
