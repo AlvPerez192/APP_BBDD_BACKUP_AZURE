@@ -1,0 +1,253 @@
+# =============================================================================
+# WORKFLOW: backup-azure-db.yml
+# REPO:     APP_BBDD_BACKUP_AZURE
+#
+# Propósito:
+#   Hacer un dump de Azure DB MySQL (Flexible Server) y subirlo a:
+#     - Azure Blob Storage (db-backups/)
+#     - AWS S3 (s3://tfg-gym-backups/dumps/)
+#
+# Flujo:
+#   1. Login en Azure
+#   2. Configurar credenciales AWS
+#   3. Conectar por SSH a la VM Azure (sshpass)
+#   4. Instalar AWS CLI en la VM si no está
+#   5. mysqldump de Azure DB (desde la VM, acceso VNet al FQDN privado)
+#   6. Subir dump a Azure Blob Storage (con timestamp + latest.sql)
+#   7. Subir dump a S3 (con timestamp + latest.sql)
+#   8. Verificar ambos destinos
+#   9. Limpiar fichero local
+#
+# Notas:
+#   - El dump se ejecuta DESDE la VM Azure, no desde el runner de GitHub Actions
+#   - La VM accede a Azure DB por FQDN privado (resolución DNS interna VNet)
+#   - Las credenciales AWS se pasan a la VM vía fichero temporal /tmp/backup-env.sh
+#   - Se usa sshpass para conexión SSH por contraseña a la VM
+# =============================================================================
+
+name: "Backup Azure DB → Blob + S3"
+
+on:
+  workflow_dispatch:
+    inputs:
+      vm_ip:
+        description: "IP pública de la VM Azure"
+        required: true
+        type: string
+
+env:
+  AZURE_VM_USER: "azureuser"
+  AZURE_VM_IP: ${{ github.event.inputs.vm_ip }}
+  AZURE_DB_FQDN: "tfg-pilot-mysql-alvaro-2026.mysql.database.azure.com"
+  AZURE_DB_USER: "admin_tfg"
+  AZURE_DB_NAME: "gym"
+  STORAGE_ACCOUNT: "stgalvarospain2026"
+  BLOB_CONTAINER: "db-backups"
+  S3_BUCKET: "tfg-gym-backups"
+  S3_PREFIX: "dumps"
+  AWS_REGION: "us-east-1"
+  TIMESTAMP: ""
+
+jobs:
+  backup-azure-db:
+    name: "Dump Azure DB → Blob + S3"
+    runs-on: ubuntu-latest
+
+    steps:
+      # === FASE 1: LOGIN Y CONFIGURACIÓN DE CREDENCIALES ===
+
+      - name: "Fase 1.1 — Login en Azure"
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: "Fase 1.2 — Configurar credenciales AWS"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Fase 1.3 — Generar timestamp"
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
+          echo "📅 Timestamp del backup: $TIMESTAMP"
+
+      - name: "Fase 1.4 — Instalar sshpass"
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq sshpass
+
+      # === FASE 2: PREPARAR VM Y EJECUTAR DUMP ===
+
+      - name: "Fase 2.1 — Instalar AWS CLI en la VM si no está"
+        run: |
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << 'INSTALL_EOF'
+          if ! command -v aws &> /dev/null; then
+            echo "⬇️  Instalando AWS CLI..."
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq awscli
+            echo "✅ AWS CLI instalado: $(aws --version)"
+          else
+            echo "✅ AWS CLI ya instalado: $(aws --version)"
+          fi
+          INSTALL_EOF
+
+      - name: "Fase 2.2 — Crear fichero de credenciales AWS en la VM"
+        run: |
+          # Crear fichero temporal con credenciales AWS
+          cat > /tmp/backup-env.sh << 'ENVEOF'
+          export AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}"
+          export AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          export AWS_SESSION_TOKEN="${{ secrets.AWS_SESSION_TOKEN }}"
+          export AWS_DEFAULT_REGION="${{ env.AWS_REGION }}"
+          ENVEOF
+
+          # Copiar fichero a la VM
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            scp -o StrictHostKeyChecking=no /tmp/backup-env.sh \
+            ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }}:/tmp/backup-env.sh
+
+          echo "✅ Credenciales AWS copiadas a la VM"
+
+      - name: "Fase 2.3 — Ejecutar mysqldump en la VM"
+        run: |
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << DUMP_EOF
+          echo "🔄 Ejecutando mysqldump de Azure DB..."
+          mysqldump -h ${{ env.AZURE_DB_FQDN }} \
+            -u ${{ env.AZURE_DB_USER }} \
+            -p'${{ secrets.DB_PASSWORD }}' \
+            --single-transaction \
+            --skip-lock-tables \
+            --no-tablespaces \
+            --set-gtid-purged=OFF \
+            --routines \
+            --triggers \
+            ${{ env.AZURE_DB_NAME }} > /tmp/gym_backup.sql
+
+          DUMP_SIZE=\$(stat -c%s /tmp/gym_backup.sql 2>/dev/null || echo "0")
+          echo "✅ Dump completado — Tamaño: \${DUMP_SIZE} bytes"
+
+          if [ "\${DUMP_SIZE}" -lt 100 ]; then
+            echo "❌ ERROR: El dump parece vacío o demasiado pequeño"
+            cat /tmp/gym_backup.sql
+            exit 1
+          fi
+          DUMP_EOF
+
+      # === FASE 3: SUBIR DUMP A AZURE BLOB STORAGE ===
+
+      - name: "Fase 3.1 — Descargar dump de la VM al runner"
+        run: |
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            scp -o StrictHostKeyChecking=no \
+            ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }}:/tmp/gym_backup.sql \
+            /tmp/gym_backup.sql
+
+          ls -lh /tmp/gym_backup.sql
+          echo "✅ Dump descargado al runner"
+
+      - name: "Fase 3.2 — Subir dump a Azure Blob Storage"
+        run: |
+          echo "📤 Subiendo dump a Azure Blob Storage..."
+
+          # Subir con timestamp
+          az storage blob upload \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
+            --container-name ${{ env.BLOB_CONTAINER }} \
+            --name "gym_backup_${{ env.TIMESTAMP }}.sql" \
+            --file /tmp/gym_backup.sql \
+            --overwrite \
+            --only-show-errors
+
+          # Subir como latest.sql
+          az storage blob upload \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
+            --container-name ${{ env.BLOB_CONTAINER }} \
+            --name "latest.sql" \
+            --file /tmp/gym_backup.sql \
+            --overwrite \
+            --only-show-errors
+
+          echo "✅ Dump subido a Azure Blob Storage (timestamp + latest.sql)"
+
+      # === FASE 4: SUBIR DUMP A S3 ===
+
+      - name: "Fase 4.1 — Subir dump a S3 desde la VM"
+        run: |
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << S3_EOF
+          echo "📤 Subiendo dump a S3..."
+
+          # Cargar credenciales AWS
+          source /tmp/backup-env.sh
+
+          # Subir con timestamp
+          aws s3 cp /tmp/gym_backup.sql \
+            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/gym_backup_${{ env.TIMESTAMP }}.sql
+
+          # Subir como latest.sql
+          aws s3 cp /tmp/gym_backup.sql \
+            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql
+
+          echo "✅ Dump subido a S3 (timestamp + latest.sql)"
+          S3_EOF
+
+      # === FASE 5: VERIFICACIÓN ===
+
+      - name: "Fase 5.1 — Verificar dump en Azure Blob Storage"
+        run: |
+          echo "🔍 Verificando dump en Azure Blob Storage..."
+          az storage blob show \
+            --account-name ${{ env.STORAGE_ACCOUNT }} \
+            --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
+            --container-name ${{ env.BLOB_CONTAINER }} \
+            --name "latest.sql" \
+            --query "{nombre: name, tamaño: properties.contentLength, modificado: properties.lastModified}" \
+            --output table \
+            --only-show-errors
+
+          echo "✅ Verificación Azure Blob OK"
+
+      - name: "Fase 5.2 — Verificar dump en S3"
+        run: |
+          echo "🔍 Verificando dump en S3..."
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/gym_backup_${{ env.TIMESTAMP }}.sql
+
+          echo "✅ Verificación S3 OK"
+
+      # === FASE 6: LIMPIEZA ===
+
+      - name: "Fase 6.1 — Limpiar ficheros temporales"
+        if: always()
+        run: |
+          # Limpiar en la VM
+          sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
+            ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} \
+            "rm -f /tmp/gym_backup.sql /tmp/backup-env.sh" || true
+
+          # Limpiar en el runner
+          rm -f /tmp/gym_backup.sql /tmp/backup-env.sh
+
+          echo "🧹 Ficheros temporales eliminados"
+
+      - name: "Resumen del backup"
+        run: |
+          echo "=========================================="
+          echo "✅ BACKUP AZURE DB COMPLETADO"
+          echo "=========================================="
+          echo "📅 Timestamp:  ${{ env.TIMESTAMP }}"
+          echo "📦 Azure Blob: ${{ env.STORAGE_ACCOUNT }}/${{ env.BLOB_CONTAINER }}/latest.sql"
+          echo "📦 AWS S3:     s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql"
+          echo "=========================================="
+          echo ""
+          echo "👉 Siguiente paso del failback:"
+          echo "   Ejecutar 'restore-rds-from-s3.yml' en el repo AWS_APP_BBDD"
+          echo "=========================================="

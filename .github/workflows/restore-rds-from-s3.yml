@@ -1,0 +1,249 @@
+# =============================================================================
+# WORKFLOW: restore-rds-from-s3.yml
+# REPO:     AWS_APP_BBDD
+#
+# Propósito:
+#   Descargar el último dump de S3 y restaurarlo en RDS MySQL,
+#   sustituyendo el contenido existente de la BD gym.
+#   Este es el paso final del failback de Azure → AWS.
+#
+# Flujo:
+#   1. Configurar credenciales AWS
+#   2. Configurar clave SSH para el bastión
+#   3. Descargar latest.sql de S3 al runner
+#   4. Copiar dump al bastión vía SCP
+#   5. DROP de todas las tablas en RDS (limpieza previa)
+#   6. Restaurar dump en RDS
+#   7. Verificar: SHOW TABLES + SELECT COUNT(*) FROM clientes
+#   8. Limpiar ficheros temporales
+#
+# Notas:
+#   - El DROP previo es necesario porque el dump contiene CREATE TABLE
+#     que fallarían si las tablas ya existen con datos diferentes
+#   - Se desactivan FOREIGN_KEY_CHECKS durante el DROP
+#   - La restauración se hace desde el bastión (acceso a RDS por Security Group)
+# =============================================================================
+
+name: "Restore RDS desde S3 (Failback)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      bastion_ip:
+        description: "IP pública del bastión AWS"
+        required: true
+        type: string
+      rds_endpoint:
+        description: "Endpoint DNS de RDS"
+        required: true
+        type: string
+
+env:
+  BASTION_USER: "ubuntu"
+  BASTION_IP: ${{ github.event.inputs.bastion_ip }}
+  RDS_ENDPOINT: ${{ github.event.inputs.rds_endpoint }}
+  DB_NAME: "gym"
+  S3_BUCKET: "tfg-gym-backups"
+  S3_PREFIX: "dumps"
+  AWS_REGION: "us-east-1"
+  SSH_KEY_PATH: "~/.ssh/tfg-gym-key"
+
+jobs:
+  restore-rds:
+    name: "Restaurar RDS desde S3"
+    runs-on: ubuntu-latest
+
+    steps:
+      # === FASE 1: CONFIGURACIÓN DE CREDENCIALES ===
+
+      - name: "Fase 1.1 — Configurar credenciales AWS"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: "Fase 1.2 — Configurar clave SSH"
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ${{ env.SSH_KEY_PATH }}
+          chmod 600 ${{ env.SSH_KEY_PATH }}
+          ssh-keyscan -H ${{ env.BASTION_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+          echo "✅ Clave SSH configurada"
+
+      # === FASE 2: DESCARGAR DUMP DE S3 ===
+
+      - name: "Fase 2.1 — Descargar latest.sql de S3"
+        run: |
+          echo "⬇️  Descargando dump de S3..."
+          aws s3 cp s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql /tmp/latest.sql
+
+          DUMP_SIZE=$(stat -c%s /tmp/latest.sql 2>/dev/null || echo "0")
+          echo "✅ Dump descargado — Tamaño: ${DUMP_SIZE} bytes"
+
+          if [ "${DUMP_SIZE}" -lt 100 ]; then
+            echo "❌ ERROR: El dump parece vacío o demasiado pequeño"
+            exit 1
+          fi
+
+      # === FASE 3: COPIAR DUMP AL BASTIÓN ===
+
+      - name: "Fase 3.1 — Copiar dump al bastión vía SCP"
+        run: |
+          echo "📤 Copiando dump al bastión..."
+          scp -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            /tmp/latest.sql \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:/tmp/latest.sql
+
+          echo "✅ Dump copiado al bastión"
+
+      # === FASE 4: DROP DE TABLAS EXISTENTES EN RDS ===
+
+      - name: "Fase 4.1 — Crear script de credenciales en el bastión"
+        run: |
+          # Crear fichero temporal con credenciales de BD
+          cat > /tmp/backup-env.sh << 'ENVEOF'
+          export DB_HOST="${{ env.RDS_ENDPOINT }}"
+          export DB_USER="${{ secrets.DB_USER }}"
+          export DB_PASS="${{ secrets.DB_PASSWORD }}"
+          export DB_NAME="${{ env.DB_NAME }}"
+          ENVEOF
+
+          # Copiar al bastión
+          scp -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            /tmp/backup-env.sh \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }}:/tmp/backup-env.sh
+
+          echo "✅ Credenciales de BD copiadas al bastión"
+
+      - name: "Fase 4.2 — DROP de todas las tablas en RDS"
+        run: |
+          echo "🗑️  Eliminando tablas existentes en RDS..."
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} << 'DROP_EOF'
+
+          source /tmp/backup-env.sh
+
+          echo "🔍 Obteniendo lista de tablas en la BD ${DB_NAME}..."
+          TABLES=$(mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            -N -e "SHOW TABLES;" "${DB_NAME}" 2>/dev/null)
+
+          if [ -z "$TABLES" ]; then
+            echo "ℹ️  No hay tablas que eliminar — la BD está vacía"
+            exit 0
+          fi
+
+          echo "📋 Tablas encontradas:"
+          echo "$TABLES"
+
+          # Construir script SQL con DROP de todas las tablas
+          DROP_SQL="SET FOREIGN_KEY_CHECKS = 0;"
+          for TABLE in $TABLES; do
+            DROP_SQL="${DROP_SQL} DROP TABLE IF EXISTS \`${TABLE}\`;"
+          done
+          DROP_SQL="${DROP_SQL} SET FOREIGN_KEY_CHECKS = 1;"
+
+          echo "🗑️  Ejecutando DROP de todas las tablas..."
+          mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            "${DB_NAME}" -e "${DROP_SQL}"
+
+          # Verificar que no quedan tablas
+          REMAINING=$(mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            -N -e "SHOW TABLES;" "${DB_NAME}" 2>/dev/null)
+
+          if [ -z "$REMAINING" ]; then
+            echo "✅ Todas las tablas eliminadas correctamente"
+          else
+            echo "❌ ERROR: Aún quedan tablas:"
+            echo "$REMAINING"
+            exit 1
+          fi
+          DROP_EOF
+
+      # === FASE 5: RESTAURAR DUMP EN RDS ===
+
+      - name: "Fase 5.1 — Restaurar dump en RDS"
+        run: |
+          echo "🔄 Restaurando dump en RDS..."
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} << 'RESTORE_EOF'
+
+          source /tmp/backup-env.sh
+
+          echo "⏳ Importando /tmp/latest.sql en RDS..."
+          mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            "${DB_NAME}" < /tmp/latest.sql
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Dump restaurado correctamente en RDS"
+          else
+            echo "❌ ERROR: Falló la restauración del dump"
+            exit 1
+          fi
+          RESTORE_EOF
+
+      # === FASE 6: VERIFICACIÓN ===
+
+      - name: "Fase 6.1 — Verificar tablas y datos en RDS"
+        run: |
+          echo "🔍 Verificando restauración en RDS..."
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} << 'VERIFY_EOF'
+
+          source /tmp/backup-env.sh
+
+          echo ""
+          echo "📋 SHOW TABLES:"
+          mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            "${DB_NAME}" -e "SHOW TABLES;"
+
+          echo ""
+          echo "📊 Conteo de registros en clientes:"
+          mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            "${DB_NAME}" -e "SELECT COUNT(*) AS total_clientes FROM clientes;"
+
+          echo ""
+          echo "📊 Resumen de todas las tablas:"
+          TABLES=$(mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+            -N -e "SHOW TABLES;" "${DB_NAME}" 2>/dev/null)
+
+          for TABLE in $TABLES; do
+            COUNT=$(mysql -h "${DB_HOST}" -u "${DB_USER}" -p"${DB_PASS}" \
+              -N -e "SELECT COUNT(*) FROM \`${TABLE}\`;" "${DB_NAME}" 2>/dev/null)
+            echo "  - ${TABLE}: ${COUNT} registros"
+          done
+
+          echo ""
+          echo "✅ Verificación completada"
+          VERIFY_EOF
+
+      # === FASE 7: LIMPIEZA ===
+
+      - name: "Fase 7.1 — Limpiar ficheros temporales"
+        if: always()
+        run: |
+          # Limpiar en el bastión
+          ssh -i ${{ env.SSH_KEY_PATH }} -o StrictHostKeyChecking=no \
+            ${{ env.BASTION_USER }}@${{ env.BASTION_IP }} \
+            "rm -f /tmp/latest.sql /tmp/backup-env.sh" || true
+
+          # Limpiar en el runner
+          rm -f /tmp/latest.sql /tmp/backup-env.sh
+
+          echo "🧹 Ficheros temporales eliminados"
+
+      - name: "Resumen de la restauración"
+        run: |
+          echo "=========================================="
+          echo "✅ RESTAURACIÓN RDS COMPLETADA"
+          echo "=========================================="
+          echo "📦 Origen:    s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql"
+          echo "🎯 Destino:   ${{ env.RDS_ENDPOINT }} → BD ${{ env.DB_NAME }}"
+          echo "🔗 Bastión:   ${{ env.BASTION_IP }}"
+          echo "=========================================="
+          echo ""
+          echo "👉 Siguientes pasos del failback:"
+          echo "   1. Verificar la app: https://${{ env.BASTION_IP }}/health.php"
+          echo "   2. Ejecutar 'destroy-pilot-light.yml' en APP_BBDD_BACKUP_AZURE"
+          echo "=========================================="
