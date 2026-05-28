@@ -73,7 +73,7 @@ jobs:
         run: |
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           echo "TIMESTAMP=$TIMESTAMP" >> $GITHUB_ENV
-          echo "📅 Timestamp del backup: $TIMESTAMP"
+          echo " Timestamp del backup: $TIMESTAMP"
 
       - name: "Fase 1.4 — Instalar sshpass"
         run: |
@@ -87,12 +87,12 @@ jobs:
           sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
             ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << 'INSTALL_EOF'
           if ! command -v aws &> /dev/null; then
-            echo "⬇️  Instalando AWS CLI..."
+            echo "  Instalando AWS CLI..."
             sudo apt-get update -qq
             sudo apt-get install -y -qq awscli
-            echo "✅ AWS CLI instalado: $(aws --version)"
+            echo " AWS CLI instalado: $(aws --version)"
           else
-            echo "✅ AWS CLI ya instalado: $(aws --version)"
+            echo " AWS CLI ya instalado: $(aws --version)"
           fi
           INSTALL_EOF
 
@@ -111,13 +111,13 @@ jobs:
             scp -o StrictHostKeyChecking=no /tmp/backup-env.sh \
             ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }}:/tmp/backup-env.sh
 
-          echo "✅ Credenciales AWS copiadas a la VM"
+          echo " Credenciales AWS copiadas a la VM"
 
       - name: "Fase 2.3 — Ejecutar mysqldump en la VM"
         run: |
           sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
             ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << DUMP_EOF
-          echo "🔄 Ejecutando mysqldump de Azure DB..."
+          echo " Ejecutando mysqldump de Azure DB..."
           mysqldump -h ${{ env.AZURE_DB_FQDN }} \
             -u ${{ env.AZURE_DB_USER }} \
             -p'${{ secrets.DB_PASSWORD }}' \
@@ -130,10 +130,10 @@ jobs:
             ${{ env.AZURE_DB_NAME }} > /tmp/gym_backup.sql
 
           DUMP_SIZE=\$(stat -c%s /tmp/gym_backup.sql 2>/dev/null || echo "0")
-          echo "✅ Dump completado — Tamaño: \${DUMP_SIZE} bytes"
+          echo " Dump completado — Tamaño: \${DUMP_SIZE} bytes"
 
           if [ "\${DUMP_SIZE}" -lt 100 ]; then
-            echo "❌ ERROR: El dump parece vacío o demasiado pequeño"
+            echo " ERROR: El dump parece vacío o demasiado pequeño"
             cat /tmp/gym_backup.sql
             exit 1
           fi
@@ -149,11 +149,11 @@ jobs:
             /tmp/gym_backup.sql
 
           ls -lh /tmp/gym_backup.sql
-          echo "✅ Dump descargado al runner"
+          echo " Dump descargado al runner"
 
       - name: "Fase 3.2 — Subir dump a Azure Blob Storage"
         run: |
-          echo "📤 Subiendo dump a Azure Blob Storage..."
+          echo " Subiendo dump a Azure Blob Storage..."
 
           # Subir con timestamp
           az storage blob upload \
@@ -175,7 +175,7 @@ jobs:
             --overwrite \
             --only-show-errors
 
-          echo "✅ Dump subido a Azure Blob Storage (timestamp + latest.sql)"
+          echo " Dump subido a Azure Blob Storage (timestamp + latest.sql)"
 
       # === FASE 4: SUBIR DUMP A S3 ===
 
@@ -183,7 +183,7 @@ jobs:
         run: |
           sshpass -p '${{ secrets.VM_ADMIN_PASSWORD }}' \
             ssh -o StrictHostKeyChecking=no ${{ env.AZURE_VM_USER }}@${{ env.AZURE_VM_IP }} << S3_EOF
-          echo "📤 Subiendo dump a S3..."
+          echo " Subiendo dump a S3..."
 
           # Cargar credenciales AWS
           source /tmp/backup-env.sh
@@ -196,14 +196,14 @@ jobs:
           aws s3 cp /tmp/gym_backup.sql \
             s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql
 
-          echo "✅ Dump subido a S3 (timestamp + latest.sql)"
+          echo " Dump subido a S3 (timestamp + latest.sql)"
           S3_EOF
 
       # === FASE 5: VERIFICACIÓN ===
 
       - name: "Fase 5.1 — Verificar dump en Azure Blob Storage"
         run: |
-          echo "🔍 Verificando dump en Azure Blob Storage..."
+          echo " Verificando dump en Azure Blob Storage..."
           az storage blob show \
             --account-name ${{ env.STORAGE_ACCOUNT }} \
             --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
@@ -213,15 +213,15 @@ jobs:
             --output table \
             --only-show-errors
 
-          echo "✅ Verificación Azure Blob OK"
+          echo " Verificación Azure Blob OK"
 
       - name: "Fase 5.2 — Verificar dump en S3"
         run: |
-          echo "🔍 Verificando dump en S3..."
+          echo " Verificando dump en S3..."
           aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql
           aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/gym_backup_${{ env.TIMESTAMP }}.sql
 
-          echo "✅ Verificación S3 OK"
+          echo " Verificación S3 OK"
 
       # === FASE 6: LIMPIEZA ===
 
@@ -241,13 +241,13 @@ jobs:
       - name: "Resumen del backup"
         run: |
           echo "=========================================="
-          echo "✅ BACKUP AZURE DB COMPLETADO"
+          echo " BACKUP AZURE DB COMPLETADO"
           echo "=========================================="
-          echo "📅 Timestamp:  ${{ env.TIMESTAMP }}"
-          echo "📦 Azure Blob: ${{ env.STORAGE_ACCOUNT }}/${{ env.BLOB_CONTAINER }}/latest.sql"
-          echo "📦 AWS S3:     s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql"
+          echo " Timestamp:  ${{ env.TIMESTAMP }}"
+          echo " Azure Blob: ${{ env.STORAGE_ACCOUNT }}/${{ env.BLOB_CONTAINER }}/latest.sql"
+          echo " AWS S3:     s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.sql"
           echo "=========================================="
           echo ""
-          echo "👉 Siguiente paso del failback:"
+          echo " Siguiente paso del failback:"
           echo "   Ejecutar 'restore-rds-from-s3.yml' en el repo AWS_APP_BBDD"
           echo "=========================================="
