@@ -209,7 +209,7 @@ jobs:
             --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
             --container-name ${{ env.BLOB_CONTAINER }} \
             --name "latest.sql" \
-            --query "{nombre: name, tamaño: properties.contentLength, modificado: properties.lastModified}" \
+            --prefix "latest.sql"
             --output table \
             --only-show-errors
 
